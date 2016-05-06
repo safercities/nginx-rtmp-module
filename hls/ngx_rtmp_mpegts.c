@@ -10,9 +10,7 @@
 
 #include "ngx_rtmp_codec_module.h"
 
-static u_char ngx_rtmp_mpegts_header[] = {
-
-        /* https://en.wikipedia.org/wiki/MPEG_transport_stream#Packet */
+static u_char ngx_rtmp_mpegts_header_pat[] = {
 
     /* TS Header */
     0x47,                                               // Sync byte
@@ -28,7 +26,7 @@ static u_char ngx_rtmp_mpegts_header[] = {
     /* PAT program loop */
     0x00, 0x01, 0xef, 0xff,                             // program_number(16), reserved(3) + program_map_pid(13)
     /* PAT crc (CRC-32-MPEG2) */
-    0x36, 0x90, 0xe2, 0x3d,                             // !!! Needs to be recalculated each time any bit in PAT is modified !!!
+    0x36, 0x90, 0xe2, 0x3d,                             // !!! Needs to be recalculated each time any bit in PAT is modified !!! (although we dont )
 
     /* stuffing 167 bytes */
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -48,7 +46,11 @@ static u_char ngx_rtmp_mpegts_header[] = {
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
 
+
+//PMT header stuffing calculated automatically
+static u_char ngx_rtmp_mpegts_header_pmt[] = {
     /* TS Header */
     0x47,                                               // Sync byte
     0x4f, 0xff,                                         // TEI(1) + PUS(1) + TP(1) + PID(13)
@@ -60,20 +62,41 @@ static u_char ngx_rtmp_mpegts_header[] = {
     0xb0, 0x17,                                         // 1011b(4) + section_length(12)
     0x00, 0x01,                                         // program_number(16)
     0xc1, 0x00, 0x00,                                   // 11b(2) + VN(5) + CNI(1), section_no(8), last_section_no(8)
-    0xe1, 0x00,                                         // reserved(3) + PCR_PID(13)
+    0xe1, 0x00,                                         // reserved(3) + PCR_PID(13) -  !!! need to update PCR_PID if just audio (done below) !!!
     0xf0, 0x00,                                         // reserved(4) + program_info_length(12)
-    /* PMT component loop */
-    // 1st component: H.264 Video, PID 0x100
+    /* PMT component loop goes under here */
+};
+
+static u_char ngx_rtmp_mpegts_header_pmt_h264[] = {
+    //H.264 Video, PID 0x100
     0x1b,                                               // stream_type(8)
     0xe1, 0x00,                                         // reserved(3) + elementary_PID(13)
     0xf0, 0x00,                                         // reserved(4) + ES_info_length(12)
-    // 2nd component: ADTS AAC Audio, PID 0x101
+};
+
+static u_char ngx_rtmp_mpegts_header_pmt_mp3[] = {
+    //MP3 Audio, PID 0x101
+    0x03,                                               // stream_type(8)
+    0xe1, 0x01,                                         // reserved(3) + elementary_PID(13)
+    0xf0, 0x00,                                         // reserved(4) + ES_info_length(12)
+
+    /* PMT crc (CRC-32-MPEG2) */
+    //0x4e, 0x59, 0x3d, 0x1e, /* precalculated crc for pmt with mp3 audio */
+};
+
+static u_char ngx_rtmp_mpegts_header_pmt_aac[] = {
+   //ADTS AAC Audio, PID 0x101
     0x0f,                                               // stream_type(8)
     0xe1, 0x01,                                         // reserved(3) + elementary_PID(13)
     0xf0, 0x00,                                         // reserved(4) + ES_info_length(12)
-    /* PMT crc (CRC-32-MPEG2) */
-    0x2f, 0x44, 0xb9, 0x9b,                             // !!! Needs to be recalculated each time any bit in PMT is modified !!!
 
+    /* PMT crc (CRC-32-MPEG2) */
+    //0x2f, 0x44, 0xb9, 0x9b,                             // !!! Needs to be recalculated each time any bit in PMT is modified !!!
+};
+
+
+
+static u_char ngx_rtmp_mpegts_header_pmt_pmt[] = {
     /* stuffing 157 bytes */
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -93,17 +116,6 @@ static u_char ngx_rtmp_mpegts_header[] = {
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 };
 
-static u_char ngx_rtmp_mpegts_header_mp3[] = {
-    0x03, 0xe1, 0x01, 0xf0, 0x00, /* mp3 */
-    /* CRC (of whole PMT)!!! */
-    0x4e, 0x59, 0x3d, 0x1e, /* precalculated crc for pmt with mp3 audio */
-};
-
-static u_char ngx_rtmp_mpegts_header_aac[] = {
-    0x0f, 0xe1, 0x01, 0xf0, 0x00, /* aac */
-    /* CRC (of whole PMT)!!! */
-    0x2f, 0x44, 0xb9, 0x9b, /* precalculated crc for pmt with aac audio */
-};
 
 /* 700 ms PCR delay */
 #define NGX_RTMP_HLS_DELAY  63000
@@ -214,59 +226,93 @@ static ngx_int_t
 ngx_rtmp_mpegts_write_header(ngx_rtmp_mpegts_file_t *file, ngx_rtmp_codec_ctx_t *codec_ctx, ngx_uint_t mpegts_cc)
 {
     ngx_int_t rc;
+    u_char buf[376]; //This buffer will eventually contain our whole TS packet
+
+    //Ensure the CC counter is only 4 bits
+    mpegts_cc %= 0x0f;
+
+
+    //Add the PAT
+    ngx_memcpy(buf, ngx_rtmp_mpegts_header_pat, sizeof(ngx_rtmp_mpegts_header_pat)); 
+    
+    //Add MPEGTS-CC to PAT
+    buf[3] = (buf[3] & 0xf0) + (u_char)mpegts_cc;
+
+
+    //Add the PMT
+    u_char pmt_buf[188];
+    ngx_rtmp_mpegts_crc_t pmt_crc;
+    ngx_memcpy(pmt_buf, ngx_rtmp_mpegts_header_pmt, sizeof(ngx_rtmp_mpegts_header_pmt));
+
+    //Init the PMT CRC
+    pmt_crc = ngx_rtmp_mpegts_crc_init();
+    //Set the MPEGTS-CC in the PMT
+    pmt_buf[3] = (pmt_buf[3] & 0xf0) + (u_char)mpegts_cc;
 
     //If there's both audio and video present
     if (codec_ctx->audio_codec_id && codec_ctx->video_codec_id)
     {
-        /* Write the audio headers */
-        ngx_rtmp_mpegts_set_audio_header(codec_ctx, mpegts_cc);
 
-        rc = ngx_rtmp_mpegts_write_file(file, ngx_rtmp_mpegts_header,
-                                          sizeof(ngx_rtmp_mpegts_header));
+        //Add the H264 PMT info
+        ngx_memcpy(pmt_buf+17, ngx_rtmp_mpegts_header_pmt_h264, sizeof(ngx_rtmp_mpegts_header_pmt_h264));z
+
+        //Put the right audio codec info into the PMT
+        if (codec_ctx->audio_codec_id == NGX_RTMP_AUDIO_AAC) {
+            ngx_memcpy(pmt_buf+22, ngx_rtmp_mpegts_header_pmt_aac, sizeof(ngx_rtmp_mpegts_header_pmt_aac));
+        } else {
+            ngx_memcpy(pmt_buf+22, ngx_rtmp_mpegts_header_pmt_mp3, sizeof(ngx_rtmp_mpegts_header_pmt_mp3));
+        }
+
+        //set the PMT CRC
+        pmt_crc = ngx_rtmp_mpegts_crc_update(pmt_crc, pmt_buf, sizeof(pmt_buf));
+        pmt_crc = ngx_rtmp_mpegts_crc_finalize(pmt_crc);
+        ngx_memcpy(pmt_buf+27, pmt_crc, sizeof(pmt_crc));
+
+        //Fill the rest with padding
+        ngx_memset(pmt_buf+32, 0xff, 157);
+        
     }
     else
     {
-        //Just video or just audio
-        u_char buf[sizeof(ngx_rtmp_mpegts_header)];
-
-        ngx_memcpy(buf, ngx_rtmp_mpegts_header, sizeof(ngx_rtmp_mpegts_header));
         
-        /* Fix the section length */
-        buf[195] = 0x12;
+        //Fix the section length (we only have one program)
+        pmt_buf[195] = 0x12;
 
+        //Only audio
         if (codec_ctx->audio_codec_id)
         {
-          /* Set the PCR PID to the audio PID */
-          buf[202] = 0x01;
+            /* Set the PCR PID to the audio PID */
+            pmt_buf[202] = 0x01;
 
-          /* Write the audio headers */
-          ngx_rtmp_mpegts_set_audio_header(codec_ctx, mpegts_cc);
-
-          /* Move the audio description over the video description */
-          ngx_memcpy(buf + 205, buf + 210, 5);
-
-          /* Fix the CRC partially overwriting the audio description */
-          buf[210] = 0xec;
-          buf[211] = 0xe2;
-          buf[212] = 0xb0;
-          buf[213] = 0x94;
+            //Put the right audio codec info into the PMT
+            if (codec_ctx->audio_codec_id == NGX_RTMP_AUDIO_AAC) {
+                ngx_memcpy(pmt_buf+17, ngx_rtmp_mpegts_header_pmt_aac, sizeof(ngx_rtmp_mpegts_header_pmt_aac));
+            } else {
+                ngx_memcpy(pmt_buf+17, ngx_rtmp_mpegts_header_pmt_mp3, sizeof(ngx_rtmp_mpegts_header_pmt_mp3));
+            }
+         
         }
+        //Only Video
         else
         {
-          /* Fix the CRC partially overwriting the video description */
-          buf[210] = 0x15;
-          buf[211] = 0xbd;
-          buf[212] = 0x4d;
-          buf[213] = 0x56;
+          //Add the H264 PMT info
+          ngx_memcpy(pmt_buf+17, ngx_rtmp_mpegts_header_pmt_h264, sizeof(ngx_rtmp_mpegts_header_pmt_h264)); 
         }
 
-        /* Clear the last byte of the audio description and the old CRC */
-        ngx_memset(buf + 214, 0xff, 5);
+        //set the PMT CRC
+        pmt_crc = ngx_rtmp_mpegts_crc_update(pmt_crc, pmt_buf, sizeof(pmt_buf));
+        pmt_crc = ngx_rtmp_mpegts_crc_finalize(pmt_crc);
+        ngx_memcpy(pmt_buf+22, pmt_crc, sizeof(pmt_crc));
 
-        rc = ngx_rtmp_mpegts_write_file(file, buf, sizeof(buf));
+        //Fill the rest of the PMT with padding
+        ngx_memset(pmt_buf+26, 0xff, 162);
     }
 
-    return rc;
+    //Add the PMT to the global buf
+    ngx_memcpy(buf+188, pmt_buf, sizeof(pmt_buf));
+
+    return ngx_rtmp_mpegts_write_file(file, buf, sizeof(buf));
+
     
 }
 
