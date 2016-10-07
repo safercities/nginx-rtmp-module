@@ -1483,15 +1483,22 @@ ngx_rtmp_dash_cleanup_dir(ngx_str_t *ppath, ngx_msec_t playlen)
 }
 
 
+#if (nginx_version >= 1011005)
+static ngx_msec_t
+#else
 static time_t
+#endif
 ngx_rtmp_dash_cleanup(void *data)
 {
     ngx_rtmp_dash_cleanup_t *cleanup = data;
 
     ngx_rtmp_dash_cleanup_dir(&cleanup->path, cleanup->playlen);
 
-    // Next callback in half of playlist length time
-    return cleanup->playlen / 2000;
+#if (nginx_version >= 1011005)
+    return cleanup->playlen * 2;
+#else
+    return cleanup->playlen / 500;
+#endif
 }
 
 static ngx_int_t
